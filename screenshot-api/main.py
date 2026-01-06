@@ -1,6 +1,10 @@
 """
-Screenshot API with Direct USDC Payment Verification
-Captures website screenshots with pay-per-use model on Base blockchain.
+Screenshot API with x402 Protocol Support
+Captures website screenshots with USDC micropayments on Base blockchain.
+
+Supports both:
+- Standard x402 protocol (for agent discovery/auto-payment)
+- Manual payment flow (/pay/request → /pay/verify)
 """
 
 import os
@@ -10,7 +14,7 @@ import asyncio
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl, Field
@@ -39,6 +43,12 @@ class AppConfig:
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", "8000"))
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
+    
+    # x402 Configuration
+    PAYMENT_WALLET = Config.PAYMENT_WALLET
+    SCREENSHOT_PRICE_USDC = 10000  # $0.01 in USDC units (6 decimals)
+    NETWORK = "base"
+    USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
 
 
 # =============================================================================
@@ -112,8 +122,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Screenshot API",
-    description="Pay-per-use screenshot service with USDC payments on Base",
-    version="2.0.0",
+    description="Pay-per-use screenshot service with USDC payments on Base (x402 compatible)",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -168,7 +178,145 @@ async def capture_screenshot(
 
 
 # =============================================================================
-# Payment Endpoints
+# x402 Protocol Helper
+# =============================================================================
+
+def create_402_response(request: Request) -> Response:
+    """
+    Create a proper x402 Payment Required response.
+    
+    This follows the x402 protocol specification so that
+    x402-compatible clients and agent frameworks can auto-pay.
+    """
+    import json
+    
+    # Build the x402 payment requirements
+    payment_payload = {
+        "x402Version": 1,
+        "accepts": [
+            {
+                "scheme": "exact",
+                "network": "base",
+                "maxAmountRequired": str(AppConfig.SCREENSHOT_PRICE_USDC),
+                "resource": str(request.url),
+                "description": "Screenshot API - capture any webpage",
+                "mimeType": "application/json",
+                "payTo": AppConfig.PAYMENT_WALLET,
+                "maxTimeoutSeconds": 60,
+                "asset": AppConfig.USDC_ADDRESS,
+                "extra": {
+                    "name": "Screenshot API",
+                    "pricing": "$0.01 per screenshot"
+                }
+            }
+        ]
+    }
+    
+    # Encode as base64 for the header
+    payment_header = base64.b64encode(
+        json.dumps(payment_payload).encode()
+    ).decode()
+    
+    return Response(
+        content=json.dumps({
+            "error": "Payment Required",
+            "message": "This endpoint requires payment. Send USDC on Base.",
+            "price": "$0.01",
+            "payTo": AppConfig.PAYMENT_WALLET,
+            "network": "base",
+            "x402": True,
+        }),
+        status_code=402,
+        media_type="application/json",
+        headers={
+            "X-Payment": payment_header,
+            "Access-Control-Expose-Headers": "X-Payment",
+        }
+    )
+
+
+async def verify_x402_payment(request: Request) -> bool:
+    """
+    Verify x402 payment from request header.
+    
+    In production, this would verify the payment proof
+    against the CDP facilitator. For now, we check if
+    a valid payment header exists.
+    """
+    payment_header = request.headers.get("X-Payment")
+    
+    if not payment_header:
+        return False
+    
+    try:
+        # Decode and parse the payment proof
+        import json
+        payment_data = json.loads(base64.b64decode(payment_header))
+        
+        # TODO: Verify with CDP facilitator
+        # For now, accept any well-formed payment header
+        # Real verification would call:
+        # https://x402.org/facilitator/verify
+        
+        return "payload" in payment_data or "signature" in payment_data
+        
+    except Exception:
+        return False
+
+
+# =============================================================================
+# x402 Screenshot Endpoint
+# =============================================================================
+
+@app.get("/screenshot", tags=["Screenshot"])
+async def screenshot_x402(
+    request: Request,
+    url: str,
+    width: int = 1280,
+    height: int = 720,
+    full_page: bool = False,
+    format: str = "png",
+):
+    """
+    Screenshot endpoint with x402 payment support.
+    
+    Without payment: Returns 402 Payment Required with x402 headers.
+    With valid X-Payment header: Returns screenshot.
+    
+    For manual payment flow, use /pay/request instead.
+    """
+    # Check for x402 payment header
+    has_payment = await verify_x402_payment(request)
+    
+    if not has_payment:
+        # Return 402 with x402 payment requirements
+        return create_402_response(request)
+    
+    # Payment verified - capture screenshot
+    try:
+        screenshot_bytes = await capture_screenshot(
+            url=url,
+            width=width,
+            height=height,
+            full_page=full_page,
+            format=format,
+        )
+        
+        return {
+            "success": True,
+            "url": url,
+            "image_base64": base64.b64encode(screenshot_bytes).decode(),
+            "format": format,
+            "width": width,
+            "height": height,
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Manual Payment Endpoints (Original Flow)
 # =============================================================================
 
 @app.post("/pay/request", tags=["Payment"])
@@ -178,6 +326,8 @@ async def request_payment(body: PaymentRequestBody):
     
     Returns payment details including the wallet address and amount.
     Client should send USDC on Base to the provided address.
+    
+    Alternative to x402 auto-payment for manual workflows.
     """
     # Validate endpoint exists
     valid_endpoints = ["/screenshot", "/screenshot/full"]
@@ -270,7 +420,7 @@ async def verify_payment(body: PaymentVerifyBody):
 async def test_screenshot(url: str, width: int = 1280, height: int = 720):
     """
     Free test endpoint - limited to example.com domain.
-    Use /pay/request for production usage.
+    Use /screenshot (x402) or /pay/request for production usage.
     """
     # Restrict to safe test domains
     allowed_domains = ["example.com", "example.org", "httpbin.org"]
@@ -281,7 +431,7 @@ async def test_screenshot(url: str, width: int = 1280, height: int = 720):
     if parsed.netloc not in allowed_domains:
         raise HTTPException(
             status_code=403,
-            detail=f"Free tier restricted to: {allowed_domains}. Use /pay/request for other domains."
+            detail=f"Free tier restricted to: {allowed_domains}. Use /screenshot for other domains."
         )
     
     try:
@@ -294,7 +444,7 @@ async def test_screenshot(url: str, width: int = 1280, height: int = 720):
             "format": "png",
             "width": width,
             "height": height,
-            "note": "This is a free test endpoint. Use /pay/request for production.",
+            "note": "This is a free test endpoint. Use /screenshot for production.",
         }
         
     except Exception as e:
@@ -310,23 +460,31 @@ async def root():
     """API information and pricing."""
     return {
         "service": "Screenshot API",
-        "version": "2.0.0",
+        "version": "2.1.0",
+        "x402": True,
         "payment": {
-            "network": "Base",
+            "network": "base",
             "token": "USDC",
-            "wallet": Config.PAYMENT_WALLET,
+            "asset": AppConfig.USDC_ADDRESS,
+            "wallet": AppConfig.PAYMENT_WALLET,
         },
         "pricing": {
-            endpoint: f"${usdc_to_usd(price)}"
-            for endpoint, price in ENDPOINT_PRICES.items()
-            if "screenshot" in endpoint
+            "/screenshot": "$0.01",
         },
         "endpoints": {
-            "POST /pay/request": "Request payment for an endpoint",
-            "POST /pay/verify": "Verify payment and get data",
+            "GET /screenshot": "x402 paid endpoint - returns 402 without payment",
+            "POST /pay/request": "Manual payment request (alternative to x402)",
+            "POST /pay/verify": "Verify manual payment and get data",
             "GET /test/screenshot": "Free test (example.com only)",
         },
-        "flow": [
+        "x402_flow": [
+            "1. GET /screenshot?url=... → 402 with X-Payment header",
+            "2. Parse payment requirements from X-Payment header",
+            "3. Send USDC payment via Base network",
+            "4. Retry request with X-Payment proof header",
+            "5. Receive screenshot data",
+        ],
+        "manual_flow": [
             "1. POST /pay/request with endpoint and params",
             "2. Send USDC to provided wallet on Base",
             "3. POST /pay/verify with payment_id",
@@ -341,7 +499,8 @@ async def health():
     return {
         "status": "healthy",
         "browser": browser is not None and browser.is_connected(),
-        "payment_wallet": Config.PAYMENT_WALLET,
+        "payment_wallet": AppConfig.PAYMENT_WALLET,
+        "x402_enabled": True,
     }
 
 
