@@ -17,7 +17,7 @@ from pydantic import BaseModel, HttpUrl, Field
 from playwright.async_api import async_playwright, Browser
 
 # Add shared module to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
+sys.path.insert(0, "/app/shared")
 from payment_verify import (
     create_payment_request,
     verify_payment_request,
