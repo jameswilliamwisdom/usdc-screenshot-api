@@ -11,8 +11,11 @@ import os
 import sys
 import base64
 import asyncio
+import socket
+import ipaddress
 from typing import Optional
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,12 +46,80 @@ class AppConfig:
     HOST = os.getenv("HOST", "0.0.0.0")
     PORT = int(os.getenv("PORT", "8000"))
     DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-    
+
     # x402 Configuration
     PAYMENT_WALLET = Config.PAYMENT_WALLET
     SCREENSHOT_PRICE_USDC = 10000  # $0.01 in USDC units (6 decimals)
     NETWORK = "base"
     USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+
+
+# =============================================================================
+# Deprecation Notice — v2 sunsets 2026-05-23
+# =============================================================================
+
+DEPRECATION = {
+    "notice": "x402-mcp-server v2 is deprecated. Sunsets 2026-05-23. Migrate to Bismuth.",
+    "sunset_date": "2026-05-23",
+    "migration_url": "https://bismuth.one/migrate",
+}
+
+
+# =============================================================================
+# SSRF Validation (ported from x402-scraping-api)
+# =============================================================================
+
+ALLOWED_SCHEMES = {"http", "https"}
+
+
+def _assert_ip_public(ip) -> None:
+    """Raise ValueError if the IP is in a blocked (non-public) range."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        _assert_ip_public(ip.ipv4_mapped)
+        return
+    if (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+        raise ValueError(f"URL resolves to blocked IP range: {ip}")
+
+
+def validate_url_for_ssrf(url: str) -> None:
+    """Raises ValueError if the URL targets a private/internal resource.
+
+    Uses getaddrinfo (not gethostbyname) to catch both IPv4 and IPv6 records.
+    Checks ALL resolved addresses — not just the first.
+    """
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ALLOWED_SCHEMES:
+        raise ValueError(f"Scheme '{parsed.scheme}' not allowed; only http/https accepted")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("No hostname in URL")
+
+    try:
+        direct_ip = ipaddress.ip_address(hostname)
+        _assert_ip_public(direct_ip)
+        return
+    except ValueError as e:
+        if "blocked IP range" in str(e):
+            raise
+
+    try:
+        records = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as e:
+        raise ValueError(f"DNS resolution failed: {e}")
+
+    if not records:
+        raise ValueError("DNS resolution returned no addresses")
+
+    for record in records:
+        ip_str = record[4][0].split("%")[0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            raise ValueError(f"Could not parse resolved IP: {ip_str!r}")
+        _assert_ip_public(ip)
 
 
 # =============================================================================
@@ -134,6 +205,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =============================================================================
+# Deprecation Middleware — adds sunset headers to every response
+# =============================================================================
+
+@app.middleware("http")
+async def add_deprecation_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Deprecation"] = "true"
+    response.headers["X-Sunset-Date"] = DEPRECATION["sunset_date"]
+    response.headers["Link"] = f'<{DEPRECATION["migration_url"]}>; rel="sunset"'
+    return response
 
 
 # =============================================================================
@@ -285,13 +369,19 @@ async def screenshot_x402(
     
     For manual payment flow, use /pay/request instead.
     """
+    # SSRF guard — reject private/internal IPs BEFORE requesting payment
+    try:
+        validate_url_for_ssrf(url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"SSRF validation failed: {e}")
+
     # Check for x402 payment header
     has_payment = await verify_x402_payment(request)
-    
+
     if not has_payment:
         # Return 402 with x402 payment requirements
         return create_402_response(request)
-    
+
     # Payment verified - capture screenshot
     try:
         screenshot_bytes = await capture_screenshot(
@@ -301,7 +391,7 @@ async def screenshot_x402(
             full_page=full_page,
             format=format,
         )
-        
+
         return {
             "success": True,
             "url": url,
@@ -309,8 +399,9 @@ async def screenshot_x402(
             "format": format,
             "width": width,
             "height": height,
+            "_deprecation": DEPRECATION,
         }
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -344,16 +435,25 @@ async def request_payment(body: PaymentRequestBody):
             if "url" not in body.params:
                 raise HTTPException(status_code=400, detail="Missing 'url' in params")
             ScreenshotParams(**body.params)
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid params: {e}")
-    
+
+        # SSRF guard — block private/internal IPs BEFORE charging
+        try:
+            validate_url_for_ssrf(str(body.params["url"]))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"SSRF validation failed: {e}")
+
     # Create payment request
     payment_info = create_payment_request(body.endpoint, body.params)
-    
+
     return {
         **payment_info,
         "instructions": f"Send {payment_info['amount_usd']} USDC to {payment_info['pay_to']} on Base network",
         "next_step": "POST /pay/verify with your payment_id after sending USDC",
+        "_deprecation": DEPRECATION,
     }
 
 
@@ -408,8 +508,8 @@ async def verify_payment(body: PaymentVerifyBody):
                     "success": False,
                     "error": str(e),
                 }
-    
-    return result
+
+    return {**result, "_deprecation": DEPRECATION}
 
 
 # =============================================================================
@@ -445,6 +545,7 @@ async def test_screenshot(url: str, width: int = 1280, height: int = 720):
             "width": width,
             "height": height,
             "note": "This is a free test endpoint. Use /screenshot for production.",
+            "_deprecation": DEPRECATION,
         }
         
     except Exception as e:
@@ -490,6 +591,7 @@ async def root():
             "3. POST /pay/verify with payment_id",
             "4. Receive screenshot data when payment confirms",
         ],
+        "_deprecation": DEPRECATION,
     }
 
 
@@ -501,6 +603,7 @@ async def health():
         "browser": browser is not None and browser.is_connected(),
         "payment_wallet": AppConfig.PAYMENT_WALLET,
         "x402_enabled": True,
+        "_deprecation": DEPRECATION,
     }
 
 
