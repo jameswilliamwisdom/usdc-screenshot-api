@@ -55,17 +55,6 @@ class AppConfig:
 
 
 # =============================================================================
-# Deprecation Notice — v2 sunsets 2026-05-23
-# =============================================================================
-
-DEPRECATION = {
-    "notice": "x402-mcp-server v2 is deprecated. Sunsets 2026-05-23. Migrate to Bismuth.",
-    "sunset_date": "2026-05-23",
-    "migration_url": "https://bismuth.one/migrate",
-}
-
-
-# =============================================================================
 # SSRF Validation (ported from x402-scraping-api)
 # =============================================================================
 
@@ -205,19 +194,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-# =============================================================================
-# Deprecation Middleware — adds sunset headers to every response
-# =============================================================================
-
-@app.middleware("http")
-async def add_deprecation_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Deprecation"] = "true"
-    response.headers["X-Sunset-Date"] = DEPRECATION["sunset_date"]
-    response.headers["Link"] = f'<{DEPRECATION["migration_url"]}>; rel="sunset"'
-    return response
 
 
 # =============================================================================
@@ -399,7 +375,6 @@ async def screenshot_x402(
             "format": format,
             "width": width,
             "height": height,
-            "_deprecation": DEPRECATION,
         }
 
     except Exception as e:
@@ -453,7 +428,6 @@ async def request_payment(body: PaymentRequestBody):
         **payment_info,
         "instructions": f"Send {payment_info['amount_usd']} USDC to {payment_info['pay_to']} on Base network",
         "next_step": "POST /pay/verify with your payment_id after sending USDC",
-        "_deprecation": DEPRECATION,
     }
 
 
@@ -509,7 +483,7 @@ async def verify_payment(body: PaymentVerifyBody):
                     "error": str(e),
                 }
 
-    return {**result, "_deprecation": DEPRECATION}
+    return result
 
 
 # =============================================================================
@@ -545,7 +519,6 @@ async def test_screenshot(url: str, width: int = 1280, height: int = 720):
             "width": width,
             "height": height,
             "note": "This is a free test endpoint. Use /screenshot for production.",
-            "_deprecation": DEPRECATION,
         }
         
     except Exception as e:
@@ -591,7 +564,6 @@ async def root():
             "3. POST /pay/verify with payment_id",
             "4. Receive screenshot data when payment confirms",
         ],
-        "_deprecation": DEPRECATION,
     }
 
 
@@ -603,7 +575,6 @@ async def health():
         "browser": browser is not None and browser.is_connected(),
         "payment_wallet": AppConfig.PAYMENT_WALLET,
         "x402_enabled": True,
-        "_deprecation": DEPRECATION,
     }
 
 
