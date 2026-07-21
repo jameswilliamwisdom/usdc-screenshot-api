@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium
 
 COPY screenshot-api/main.py ./
+COPY screenshot-api/favicon.ico ./
 
 EXPOSE 8000
 CMD ["python", "main.py"]

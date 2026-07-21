@@ -19,7 +19,15 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+
+from x402.http import FacilitatorConfig, HTTPFacilitatorClient, PaymentOption
+from x402.http.middleware.fastapi import PaymentMiddlewareASGI
+from x402.http.types import RouteConfig
+from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from x402.schemas import Network
+from x402.server import x402ResourceServer
+
 from pydantic import BaseModel, HttpUrl, Field
 from playwright.async_api import async_playwright, Browser
 
@@ -181,11 +189,35 @@ async def lifespan(app: FastAPI):
 # =============================================================================
 
 app = FastAPI(
-    title="Screenshot API",
-    description="Pay-per-use screenshot service with USDC payments on Base (x402 compatible)",
-    version="2.1.0",
+    title="Bismuth Screenshot",
+    description="Playwright-powered webpage screenshot capture with full-page, viewport, and custom sizing. SSRF-protected. Part of the Bismuth utility API suite for AI agents.",
+    version="3.0.0",
     lifespan=lifespan,
+    contact={
+        "name": "Bismuth",
+        "url": "https://usebismuth.com",
+        "email": os.getenv("CONTACT_EMAIL", "james@usebismuth.com"),
+    },
 )
+
+# x402 v2 payment middleware for GET /screenshot
+# Manual /pay/request + /pay/verify flow stays custom for legacy compatibility
+PAY_TO_V2 = os.getenv("PAY_TO_ADDRESS", AppConfig.PAYMENT_WALLET)
+BASE_NETWORK_V2: Network = "eip155:8453"
+FACILITATOR_URL_V2 = os.getenv("FACILITATOR_URL", "https://facilitator.daydreams.systems")
+
+_facilitator_v2 = HTTPFacilitatorClient(FacilitatorConfig(url=FACILITATOR_URL_V2))
+_x402_server_v2 = x402ResourceServer(_facilitator_v2)
+_x402_server_v2.register(BASE_NETWORK_V2, ExactEvmServerScheme())
+
+_paid_routes_v2 = {
+    "GET /screenshot": RouteConfig(
+        accepts=[PaymentOption(scheme="exact", pay_to=PAY_TO_V2, price="$0.01", network=BASE_NETWORK_V2)],
+        mime_type="application/json",
+        description="Capture any webpage as a base64-encoded PNG/JPEG image",
+    ),
+}
+app.add_middleware(PaymentMiddlewareASGI, routes=_paid_routes_v2, server=_x402_server_v2)
 
 app.add_middleware(
     CORSMiddleware,
@@ -194,6 +226,49 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =============================================================================
+# OpenAPI x402 v2 Extensions + Favicon
+# =============================================================================
+
+_original_openapi_fn = app.openapi
+
+
+def _openapi_with_x402_v2():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = _original_openapi_fn()
+    schema["info"]["x-guidance"] = (
+        "Bismuth Screenshot — Playwright-powered webpage screenshot capture for AI agents. "
+        "GET /screenshot?url=... captures a page as a base64-encoded PNG or JPEG ($0.01 USDC on Base). "
+        "Query params: url (required), width, height, full_page, format. "
+        "SSRF-protected: private/loopback IPs rejected before payment. "
+        "Alternate manual payment flow: POST /pay/request → send USDC → POST /pay/verify."
+    )
+    for (path, method), amount in [(("/screenshot", "get"), "0.010000")]:
+        op = schema.get("paths", {}).get(path, {}).get(method)
+        if op is None:
+            continue
+        op["x-payment-info"] = {
+            "price": {"mode": "fixed", "currency": "USD", "amount": amount},
+            "protocols": [{"x402": {}}],
+        }
+        op.setdefault("responses", {})["402"] = {"description": "Payment Required"}
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = _openapi_with_x402_v2
+
+_FAVICON_PATH = os.path.join(os.path.dirname(__file__), "favicon.ico")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    if os.path.exists(_FAVICON_PATH):
+        return FileResponse(_FAVICON_PATH, media_type="image/x-icon")
+    raise HTTPException(status_code=404)
 
 
 # =============================================================================
@@ -328,7 +403,7 @@ async def verify_x402_payment(request: Request) -> bool:
 # x402 Discovery
 # =============================================================================
 
-@app.get("/.well-known/x402", tags=["Discovery"])
+@app.api_route("/.well-known/x402", methods=["GET", "HEAD"], tags=["Discovery"])
 async def well_known_x402():
     """x402 discovery — indexed by x402scan and other ecosystem crawlers."""
     return {
@@ -375,27 +450,17 @@ async def screenshot_x402(
     format: str = "png",
 ):
     """
-    Screenshot endpoint with x402 payment support.
-    
-    Without payment: Returns 402 Payment Required with x402 headers.
-    With valid X-Payment header: Returns screenshot.
-    
+    Screenshot endpoint. Payment enforced by PaymentMiddlewareASGI at the ASGI layer;
+    reaching this handler means payment was verified.
+
     For manual payment flow, use /pay/request instead.
     """
-    # SSRF guard — reject private/internal IPs BEFORE requesting payment
+    # SSRF guard — reject private/internal IPs (payment already verified by middleware)
     try:
         validate_url_for_ssrf(url)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"SSRF validation failed: {e}")
 
-    # Check for x402 payment header
-    has_payment = await verify_x402_payment(request)
-
-    if not has_payment:
-        # Return 402 with x402 payment requirements
-        return create_402_response(request)
-
-    # Payment verified - capture screenshot
     try:
         screenshot_bytes = await capture_screenshot(
             url=url,
@@ -527,7 +592,7 @@ async def verify_payment(body: PaymentVerifyBody):
 # Free Test Endpoints
 # =============================================================================
 
-@app.get("/test/screenshot", tags=["Free Test"])
+@app.api_route("/test/screenshot", methods=["GET", "HEAD"], tags=["Free Test"])
 async def test_screenshot(url: str, width: int = 1280, height: int = 720):
     """
     Free test endpoint - limited to example.com domain.
@@ -566,7 +631,7 @@ async def test_screenshot(url: str, width: int = 1280, height: int = 720):
 # Info Endpoints
 # =============================================================================
 
-@app.get("/", tags=["Info"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["Info"])
 async def root():
     """API information and pricing."""
     return {
@@ -604,7 +669,7 @@ async def root():
     }
 
 
-@app.get("/health", tags=["Info"])
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["Info"])
 async def health():
     """Health check."""
     return {
