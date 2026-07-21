@@ -325,6 +325,43 @@ async def verify_x402_payment(request: Request) -> bool:
 
 
 # =============================================================================
+# x402 Discovery
+# =============================================================================
+
+@app.get("/.well-known/x402", tags=["Discovery"])
+async def well_known_x402():
+    """x402 discovery — indexed by x402scan and other ecosystem crawlers."""
+    return {
+        "version": 1,
+        "x402Version": 2,
+        "name": "Bismuth Screenshot",
+        "description": "Playwright-powered webpage screenshot capture with full-page, viewport, and custom sizing. SSRF-protected. Part of the Bismuth utility API suite for AI agents.",
+        "apiVersion": "2.1.0",
+        "network": "base",
+        "resource": {
+            "url": "https://usdc-screenshot-api-production.up.railway.app",
+            "description": "Bismuth Screenshot — x402 USDC micropayments on Base",
+            "mimeType": "application/json",
+        },
+        "services": [
+            {
+                "name": "Capture Screenshot",
+                "endpoint": "/screenshot",
+                "method": "GET",
+                "price": "$0.01",
+                "description": "Capture any webpage as a base64-encoded PNG/JPEG image",
+            },
+        ],
+        "resources": ["GET /screenshot"],
+        "documentation": "https://usdc-screenshot-api-production.up.railway.app/docs",
+        "provider": {
+            "name": "Bismuth",
+            "url": "https://usebismuth.com",
+        },
+    }
+
+
+# =============================================================================
 # x402 Screenshot Endpoint
 # =============================================================================
 
