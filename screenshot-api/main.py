@@ -302,7 +302,14 @@ async def capture_screenshot(
     
     context = await browser.new_context(
         viewport={"width": width, "height": height},
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        # Standard RFC 9110 proxy identification — targets can block Bismuth
+        # via From/Via if they don't want to be screenshot-fetched. UA stays
+        # Chrome so we don't degrade rendering on UA-gated sites.
+        extra_http_headers={
+            "From": "abuse@usebismuth.com",
+            "Via": "1.1 bismuth-screenshot (+https://usebismuth.com)",
+        },
     )
     
     try:
@@ -449,6 +456,52 @@ async def well_known_x402():
 
 
 # =============================================================================
+# Per-Buyer Wallet Rate Limiter — protects against SSRF-proxy abuse
+# =============================================================================
+
+import threading
+from datetime import date as _date
+
+DAILY_SCREENSHOT_CAP_PER_WALLET = 500
+_wallet_screenshot_counts: dict = {}
+_wallet_lock = threading.Lock()
+
+
+def get_buyer_wallet(request: Request):
+    """Extract buyer wallet from x402 v2 middleware state."""
+    payment_payload = getattr(request.state, "payment_payload", None)
+    if payment_payload is None:
+        return None
+    try:
+        payload = payment_payload.payload if hasattr(payment_payload, "payload") else payment_payload["payload"]
+        return payload["authorization"]["from"].lower()
+    except (KeyError, TypeError, AttributeError):
+        return None
+
+
+def check_wallet_daily_cap(wallet, counter: dict, cap: int, action: str) -> None:
+    if wallet is None:
+        return
+    today = _date.today()
+    with _wallet_lock:
+        count, recorded_day = counter.get(wallet, (0, today))
+        if recorded_day != today:
+            count = 0
+        if count >= cap:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "wallet_daily_cap_exceeded",
+                    "action": action,
+                    "limit": cap,
+                    "resets": "midnight UTC",
+                    "why": "Per-buyer daily caps protect Bismuth from abuse. Contact abuse@usebismuth.com for enterprise limits.",
+                },
+            )
+        counter[wallet] = (count + 1, today)
+
+
+# =============================================================================
 # x402 Screenshot Endpoint
 # =============================================================================
 
@@ -465,8 +518,10 @@ async def screenshot_x402(
     Screenshot endpoint. Payment enforced by PaymentMiddlewareASGI at the ASGI layer;
     reaching this handler means payment was verified.
 
+    Per-buyer daily cap: 500 screenshots/wallet.
     For manual payment flow, use /pay/request instead.
     """
+    check_wallet_daily_cap(get_buyer_wallet(request), _wallet_screenshot_counts, DAILY_SCREENSHOT_CAP_PER_WALLET, "screenshot")
     # SSRF guard — reject private/internal IPs (payment already verified by middleware)
     try:
         validate_url_for_ssrf(url)
